@@ -1,92 +1,100 @@
 use std::{env};
-use std::ops::Add;
-use std::string::ToString;
+use std::env::Args;
 use std::sync::Arc;
-use futures::future::join_all;
+use futures::future::{join_all};
 use reqwest::Client;
-use serde::{Serialize, Deserialize};
-use regex::Regex;
 use tokio::task::JoinHandle;
-use tokio::sync::Semaphore;
 use std::time::Instant;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Competitor {
-    name: String,
-    id: Option<u32>,
+mod wsdc_tasks;
+use wsdc_tasks::{Competitor, create_task, preflight_check};
+
+#[derive(Debug)]
+struct Config {
+    profile: String,
+    concurrent_tasks: usize,
+}
+
+impl Config {
+    fn from_params(profile: String, concurrent_tasks: usize) -> Config {
+        Config { profile, concurrent_tasks }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new();
-    let record_location = env::var("RECORD_DIRECTORY").unwrap();
-    let wsdc_base = env::var("WSDC_URL").unwrap();
+    let program_config = parse_args(env::args())?;
 
-    let mut wsdc_autocomplete = String::from(&wsdc_base);
-    wsdc_autocomplete = wsdc_autocomplete.add("/autocomplete?q=*");
-    let wsdc_numbers = preflight_check(wsdc_autocomplete, &client).await;
-    println!("Found {} dancers", wsdc_numbers.len());
+    match program_config.profile.as_str() {
+        "full" => {
+            let client = Client::new();
+            let record_location = env::var("RECORD_DIRECTORY").unwrap();
+            let wsdc_base = env::var("WSDC_URL").unwrap();
+            let concurrent_tasks: usize = program_config.concurrent_tasks;
 
-    let mut wsdc_find = String::from(&wsdc_base);
-    wsdc_find = wsdc_find.add("/find?q=");
-    let semaphore = Arc::new(Semaphore::new(21));
-    let mut tasks: Vec<JoinHandle<Result<(), ()>>>= vec![];
-    let start_time = Instant::now();
-    println!("Starting download... (this may take a while)");
+            let wsdc_autocomplete = format!("{}/autocomplete?q=*", wsdc_base);
+            let competitors_list_start_time = Instant::now();
+            let wsdc_competitors: Vec<Competitor> = preflight_check(wsdc_autocomplete, &client).await;
+            let elapsed_time = Instant::now().duration_since(competitors_list_start_time);
+            println!("Fetched full list with query \"*\" - Duration: {:.2}s", elapsed_time.as_secs_f64());
 
-    for number in wsdc_numbers {
-        let client = client.clone();
-        let wsdc_find = wsdc_find.clone();
-        let record_location = record_location.clone();
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let task = tokio::spawn(async move {
-            let mut wsdc_url = String::from(&wsdc_find);
-            wsdc_url = wsdc_url.add(number.to_string().as_str());
-            let response = client.post(wsdc_url).send().await.unwrap();
-            if response.status().is_success() {
-                let content = response.text().await.unwrap();
-                let filename = format!("{}/{}.json", record_location, number);
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(filename)
-                    .await
-                    .unwrap();
+            println!("Starting download... (this may take a while) - errors will be printed as they occur");
+            println!("Process is allowed to run {} concurrent tasks", concurrent_tasks);
+            let tasks_start_time = Instant::now();
 
-                file.write_all(content.as_bytes()).await.unwrap();
-            } else {
-                eprintln!("Failed to download {}", number);
+            let wsdc_find = format!("{}/find?q=", wsdc_base);
+
+            let mut tasks: Vec<JoinHandle<Result<(), ()>>>= vec![];
+            let mut total_dancers: u32 = 0;
+
+            let semaphore = Arc::new(Semaphore::new(concurrent_tasks));
+            for competitor in wsdc_competitors {
+                if competitor.wscid.is_some() {
+                    total_dancers += 1;
+                    let number = competitor.wscid.unwrap();
+                    let client = client.clone();
+                    let wsdc_find = wsdc_find.clone();
+                    let record_location = record_location.clone();
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let task = create_task(number, client, wsdc_find, record_location, permit);
+                    tasks.push(task);
+                }
             }
-            drop(permit);
-            Ok(())
-        });
-        tasks.push(task);
-    }
+            println!("Found {} dancers", total_dancers);
 
-    join_all(tasks).await;
+            join_all(tasks).await;
 
-    let elapsed_time = Instant::now().duration_since(start_time);
-    println!("Elapsed time: {:.2}s", elapsed_time.as_secs_f64());
-    println!("Done!");
-    Ok(())
-}
-
-async fn preflight_check(wsdc_autocomplete: String, client: &Client) -> Vec<u32> {
-    let res = client.get(wsdc_autocomplete).send().await.unwrap().text().await.unwrap();
-    let mut dancers: Vec<Competitor> = serde_json::from_str(res.as_str()).expect("Failed to parse JSON");
-    dancers.remove(0);
-    let mut wsdc_numbers: Vec<u32> = Vec::new();
-    let re = Regex::new(r"\((\d+)\)").expect("Failed to compile regex");
-    for dancer in dancers {
-        if let Some(caps) = re.captures(dancer.name.as_str()) {
-            let number_str = caps.get(1).unwrap().as_str();
-            if let Ok(number) = number_str.parse::<u32>() {
-                wsdc_numbers.push(number);
-            }
+            let elapsed_time = Instant::now().duration_since(tasks_start_time);
+            println!("Task execution - Duration: {:.2}s", elapsed_time.as_secs_f64());
+            println!("Done!");
+            return Ok(())
+        },
+        _ => {
+            println!("Usage: wsdc_db_sync <profile> <concurrent_tasks>");
+            println!("Example: wsdc_db_sync full 30");
+            return Ok(());
         }
     }
-    wsdc_numbers.sort();
-    wsdc_numbers
+}
+
+fn parse_args(mut args: Args) -> Result<Config, &'static str> {
+    args.next(); // Skip the program name
+    let profile: String = match args.next() {
+        Some(arg) => arg,
+        None => {
+            println!("No profile specified - printing usage");
+            "".to_string()
+        },
+    };
+
+    let concurrent_tasks: usize = match args.next() {
+        Some(arg) => arg.parse::<usize>().unwrap(),
+        None => {
+            println!("No concurrent tasks specified - using default of 30");
+            30
+        },
+    };
+
+    Ok(Config::from_params(profile, concurrent_tasks))
 }
