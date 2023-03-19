@@ -30,8 +30,6 @@ pub fn create_task(number: u32, client: Client, wsdc_find: String, record_locati
                 let existing_content = read_string_from_file(filename.clone()).await;
                 if existing_content != content {
                     overwrite_string_to_file(filename.clone(), content).await;
-                } else {
-                    append_string_to_file(filename.clone(), content).await;
                 }
             } else {
                 append_string_to_file(filename.clone(), content).await;
