@@ -1,7 +1,6 @@
 use std::{env};
 use std::env::Args;
 use std::sync::Arc;
-use futures::future::{join_all};
 use reqwest::Client;
 use tokio::task::JoinHandle;
 use std::time::Instant;
@@ -38,20 +37,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wsdc_competitors: Vec<Competitor> = preflight_check(wsdc_autocomplete, &client).await;
             let elapsed_time = Instant::now().duration_since(competitors_list_start_time);
             println!("Fetched full list with query \"*\" - Duration: {:.2}s", elapsed_time.as_secs_f64());
-
-            println!("Starting download... (this may take a while) - errors will be printed as they occur");
+            {
+                let mut total_dancers: u32 = 0;
+                for c in &wsdc_competitors {
+                    if c.wscid.is_some() {
+                        total_dancers += 1;
+                    }
+                }
+                println!("Found {} dancers", total_dancers);
+            }
             println!("Process is allowed to run {} concurrent tasks", concurrent_tasks);
-            let tasks_start_time = Instant::now();
+            println!("Starting download... (this may take a while) - errors will be printed as they occur");
 
+            let tasks_start_time = Instant::now();
             let wsdc_find = format!("{}/find?q=", wsdc_base);
 
-            let mut tasks: Vec<JoinHandle<Result<(), ()>>>= vec![];
-            let mut total_dancers: u32 = 0;
-
+            let mut tasks: Vec<JoinHandle<Result<(), u32>>> = vec![];
             let semaphore = Arc::new(Semaphore::new(concurrent_tasks));
             for competitor in wsdc_competitors {
                 if competitor.wscid.is_some() {
-                    total_dancers += 1;
                     let number = competitor.wscid.unwrap();
                     let client = client.clone();
                     let wsdc_find = wsdc_find.clone();
@@ -61,9 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tasks.push(task);
                 }
             }
-            println!("Found {} dancers", total_dancers);
-
-            join_all(tasks).await;
+            // join_all(tasks).await;
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
 
             let elapsed_time = Instant::now().duration_since(tasks_start_time);
             println!("Task execution - Duration: {:.2}s", elapsed_time.as_secs_f64());
